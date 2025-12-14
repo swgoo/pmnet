@@ -62,7 +62,10 @@ class PMNetCache(DynamicCache):
         self.memory_states = []
         memory_state_shared = None
         for i in range(self.num_hidden_layers):
-            if i % self.config.memory_write_period == 0:
+            if (
+                i % self.config.memory_write_period
+                == self.config.memory_write_period - 1
+            ):
                 memory_state_shared = torch.zeros(
                     self.max_batch_size,
                     self.config.num_memory,
@@ -591,10 +594,13 @@ class PMNetMemoryReadModule(nn.Module):
 
 
 class PMNetDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: PMNetConfig, layer_idx: int):
+    def __init__(
+        self, config: PMNetConfig, layer_idx: int, memory_embeddings: nn.Parameter
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
+        self.layer_idx = layer_idx
         self.self_attn = PMNetAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = PMNetMLP(config)
@@ -604,12 +610,22 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         )
         self.attention_type = config.layer_types[layer_idx]
 
+        self.memory_embeddings = memory_embeddings
+        self.memory_read_module = PMNetMemoryReadModule(
+            config=config, layer_idx=layer_idx
+        )
+        if layer_idx % config.memory_write_period == 0:
+            self.memory_write_module = PMNetMemoryWriteModule(
+                config=config, layer_idx=layer_idx
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        memory_state: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[PMNetCache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
@@ -617,6 +633,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -635,7 +652,22 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+
+        # Memory Write
+        if hasattr(self, "memory_write_module"):
+            memory_state = memory_state + self.memory_write_module(
+                hidden_states,
+                self.memory_embeddings,
+                cache_params=past_key_values,
+            )
+
+        # Memory Read
+        hidden_states = hidden_states + self.memory_read_module(
+            hidden_states,
+            memory_state,
+            self.memory_embeddings,
+        )
+        return hidden_states, memory_state
 
 
 @auto_docstring
