@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import functools
 from typing import Optional, Union
 
 from einops import einsum, rearrange
@@ -37,13 +38,7 @@ from .configuration_pmnet import PMNetConfig
 
 
 class PMNetCache(DynamicCache):
-    """PMNet cache bundle.
-
-    - Decoder KV caching uses Hugging Face `DynamicCache` for correctness with
-      `cache_position` and masking utilities.
-    - PMNet recurrent memory states are stored separately in `memory_states` and
-      reordered alongside KV cache during beam search.
-    """
+    """PMNet cache bundle."""
 
     def __init__(
         self,
@@ -59,21 +54,20 @@ class PMNetCache(DynamicCache):
         self.dtype = dtype
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.memory_states = []
-        memory_state_shared = None
-        for i in range(self.num_hidden_layers):
-            if (
-                i % self.config.memory_write_period
-                == self.config.memory_write_period - 1
-            ):
-                memory_state_shared = torch.zeros(
-                    self.max_batch_size,
-                    self.config.num_memory,
-                    self.config.memory_size,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-            self.memory_states.append(memory_state_shared)
+        self.memory_states_storage = {}
+        for i in range(0, self.num_hidden_layers, config.memory_write_period):
+            self.memory_states_storage[i] = torch.zeros(
+                self.max_batch_size,
+                self.config.num_memory,
+                self.config.memory_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+    def _get_block_idx(self, layer_idx: int) -> int:
+        return (
+            layer_idx // self.config.memory_write_period
+        ) * self.config.memory_write_period
 
     def to(
         self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
@@ -84,35 +78,40 @@ class PMNetCache(DynamicCache):
             dtype = self.dtype
         self.device = device
         self.dtype = dtype
-        self.memory_states = self.memory_states.to(device=device, dtype=dtype)
-        # DynamicCache stores tensors internally; rely on parent implementation if available.
+
+        for k, v in self.memory_states_storage.items():
+            self.memory_states_storage[k] = v.to(device=device, dtype=dtype)
+
         if hasattr(super(), "to"):
             try:
                 super().to(device=device, dtype=dtype)
             except TypeError:
-                # Older variants may not accept dtype.
                 super().to(device)
         return self
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
         super().reorder_cache(beam_idx)
-        beam_idx = beam_idx.to(self.memory_states.device)
-        for i in range(self.num_hidden_layers):
-            self.memory_states[i] = self.memory_states[i].index_select(0, beam_idx)
-        self.max_batch_size = int(self.memory_states[0].shape[0])
+        beam_idx = beam_idx.to(self.device)
+
+        for k, v in self.memory_states_storage.items():
+            self.memory_states_storage[k] = v.index_select(0, beam_idx)
+
+        if self.memory_states_storage:
+            first_key = next(iter(self.memory_states_storage))
+            self.max_batch_size = int(self.memory_states_storage[first_key].shape[0])
+
         return self
 
     def update_memory_state(self, layer_idx: int, new_state: torch.Tensor):
-        """Update PMNet Memory State for a specific layer.
-
-        new_state: [Batch, NumMemory, MemorySize]
-        """
-        self.memory_states[layer_idx] = new_state.to(
+        """Update PMNet Memory State for a specific block."""
+        block_idx = self._get_block_idx(layer_idx)
+        self.memory_states_storage[block_idx] = new_state.to(
             device=self.device, dtype=self.dtype
         )
 
     def get_memory_state(self, layer_idx: int) -> torch.Tensor:
-        return self.memory_states[layer_idx]
+        block_idx = self._get_block_idx(layer_idx)
+        return self.memory_states_storage[block_idx]
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -454,9 +453,6 @@ class PMNetMemoryWriteModule(nn.Module):
         memory_embeddings,
         cache_params: Optional[PMNetCache] = None,
     ):
-        # hidden_states: [..., seq_len, hidden_size]
-        # memory_embeddings: [..., num_memory, memory_size]
-
         qv = self.proj_qv(self.norm(hidden_states))
         qv = rearrange(
             qv, "... (two h m) -> ... two h m", two=2, h=self.num_memory_heads
@@ -478,11 +474,9 @@ class PMNetMemoryWriteModule(nn.Module):
             .to(v.dtype)
         )
 
-        # indices: [..., H, 1]
-        # confidence: [..., H, 1]
         confidence, indices = torch.topk(scores, k=1, dim=-1)
 
-        delta = v * confidence  # [..., H, M]
+        delta = v * confidence
 
         delta = rearrange(delta, "... h m -> ... (h m)")
         delta = self.proj_out(delta)
@@ -490,20 +484,27 @@ class PMNetMemoryWriteModule(nn.Module):
         delta = torch.tanh(delta) * torch.pi
 
         if self.training and delta.requires_grad:
-            S = delta.size(1)
-            delta.register_hook(lambda grad: grad / (S**0.5))
+            S = delta.size(-3)
+            scale = S**0.5
+
+            def hook(grad):
+                return grad / scale
+
+            delta.register_hook(hook)
 
         *prefix, _, _ = delta.shape
         dtype_original = delta.dtype
         delta = delta.to(torch.float32)
+
         if cache_params is None:
             update_grid = delta.new_zeros(*prefix, self.num_memory, self.memory_size)
         else:
+            prev_memory = cache_params.get_memory_state(self.layer_idx)
             update_grid = (
-                cache_params.memory_states[self.layer_idx]
-                .to(delta.device)
+                prev_memory.to(delta.device)
                 .to(torch.float32)
                 .clone()
+                .unsqueeze(-3)
                 .expand(*prefix, self.num_memory, self.memory_size)
             )
 
@@ -699,12 +700,23 @@ class PMNetModel(PMNetPreTrainedModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
-        self.layers = nn.ModuleList(
-            [
-                PMNetDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
+
+        layers = []
+        memory_embeddings = None
+        for layer_idx in range(config.num_hidden_layers):
+            if layer_idx % config.memory_write_period == 0:
+                memory_embeddings = nn.Parameter(
+                    torch.zeros(config.num_memory, config.memory_size)
+                )
+                nn.init.normal_(memory_embeddings, mean=0.0, std=0.02)
+            layer = PMNetDecoderLayer(
+                config=config,
+                layer_idx=layer_idx,
+                memory_embeddings=memory_embeddings,
+            )
+            layers.append(layer)
+
+        self.layers = nn.ModuleList(layers)
         self.norm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = PMNetRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -735,7 +747,12 @@ class PMNetModel(PMNetPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            past_key_values = PMNetCache(
+                config=self.config,
+                max_batch_size=inputs_embeds.size(0),
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
 
         if cache_position is None:
             past_seen_tokens = (
@@ -772,11 +789,20 @@ class PMNetModel(PMNetPreTrainedModel):
                 )
 
         hidden_states = inputs_embeds
+        memory_states = torch.zeros(
+            hidden_states.size(0),
+            hidden_states.size(1),
+            self.config.num_memory,
+            self.config.memory_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            hidden_states, memory_states = decoder_layer(
                 hidden_states,
+                memory_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
