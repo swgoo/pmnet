@@ -1,0 +1,18 @@
+// README at: https://github.com/devcontainers/templates/tree/main/src/docker-existing-dockerfile
+{
+	"dockerComposeFile": [
+		"../docker-compose.yml"
+	],
+	"service": "dev",
+	"workspaceFolder": "/root/${localWorkspaceFolderBasename}",
+	"mounts": [
+		"source=${localWorkspaceFolder},target=/root/${localWorkspaceFolderBasename},type=bind"
+	],
+	"shutdownAction": "stopCompose",
+	"extensions": [
+		"ms-python.python",
+		"ms-toolsai.jupyter"
+	],
+}
+
+
