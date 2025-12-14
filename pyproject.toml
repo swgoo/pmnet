@@ -10,10 +10,7 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.7.1",
-    "triton>=3.2.0",
     "flash_attn>=2.8.3",
-    "causal-conv1d>=1.5.4",
-    "mamba-ssm>=2.2.5",
     "einops",
     "transformers>=4.57.3"
 ]
