@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from typing import Optional, Union
 
+from einops import einsum, rearrange
 import torch
 from torch import nn
 
@@ -340,6 +341,167 @@ class PMNetAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class PMNetMemoryWriteModule(nn.Module):
+    def __init__(self, config: PMNetConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.num_write_heads = config.num_write_heads
+        self.memory_size = config.memory_size
+        self.memory_size_real = 2 * config.memory_size
+        self.num_memory = config.num_memory
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+
+        self.norm = PMNetRMSNorm(self.hidden_size, eps=self.config.layer_norm_epsilon)
+        self.proj_qv = nn.Linear(
+            self.hidden_size, 2 * self.num_write_heads * self.memory_size_real
+        )
+        self.proj_k = nn.Linear(
+            self.memory_size_real, self.num_write_heads * self.memory_size_real
+        )
+        self.proj_out = nn.Linear(
+            self.num_write_heads * self.memory_size_real,
+            self.num_write_heads * self.memory_size,
+        )
+        self.delta_scale = nn.Parameter(torch.tensor(0.1))
+
+        nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(
+        self,
+        hidden_states,
+        memory_embeddings,
+        cache_params: Optional[PMNetCache] = None,
+    ):
+        # hidden_states: [..., seq_len, hidden_size]
+        # memory_embeddings: [..., num_memory, memory_size]
+
+        qv = self.proj_qv(self.norm(hidden_states))
+        qv = rearrange(
+            qv, "... (two h m) -> ... two h m", two=2, h=self.num_write_heads
+        )
+        q, v = qv[..., 0, :, :].to(torch.float32), qv[..., 1, :, :]
+
+        memory_real = torch.cat(
+            [torch.sin(memory_embeddings), torch.cos(memory_embeddings)], dim=-1
+        )
+        k = self.proj_k(memory_real).to(torch.float32)
+        k = rearrange(k, "... n (h m) -> ... h n m", h=self.num_write_heads)
+
+        scores = einsum(q, k, "... h m, ... h n m -> ... h n") / (
+            (self.memory_size) ** 0.5
+        )
+        scores = torch.softmax(scores, dim=-1).to(v.dtype)
+
+        # indices: [..., H, 1]
+        # confidence: [..., H, 1]
+        confidence, indices = torch.topk(scores, k=1, dim=-1)
+
+        delta = v * confidence  # [..., H, M]
+
+        delta = rearrange(delta, "... h m -> ... (h m)")
+        delta = self.proj_out(delta)
+        delta = rearrange(delta, "... (h m) -> ... h m", h=self.num_write_heads)
+        delta = torch.tanh(delta) * (torch.pi * torch.sigmoid(self.delta_scale))
+        if self.training and delta.requires_grad:
+            S = delta.size(1)
+            delta.register_hook(lambda grad: grad / (S**0.5))
+
+        *prefix, H, M = delta.shape
+        dtype_original = delta.dtype
+        delta = delta.to(torch.float32)
+
+        update_grid = delta.new_zeros(*prefix, self.num_memory, self.memory_size)
+        indices_expanded = indices.expand(*prefix, H, M)
+        update_grid.scatter_add_(-2, indices_expanded, delta)
+        current_cumulative = torch.cumsum(update_grid, dim=-3)
+        current_cumulative = torch.remainder(current_cumulative, 2 * torch.pi)
+
+        if cache_params is not None:
+            prev_memory = cache_params.memory_states[self.layer_idx].to(delta.device)
+
+            total_memory = prev_memory.unsqueeze(-3) + current_cumulative
+
+            new_state = torch.remainder(
+                total_memory[..., -1, :, :].clone(), 2 * torch.pi
+            )
+            cache_params.update_memory_state(self.layer_idx, new_state)
+
+            return total_memory.to(dtype_original)
+
+        return current_cumulative.to(dtype_original)
+
+
+class PMNetMemoryReadModule(nn.Module):
+    def __init__(
+        self,
+        config: PMNetConfig,
+        layer_idx: int,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.memory_size = config.memory_size
+        self.memory_size_real = 2 * config.memory_size
+        self.num_read_heads = config.num_read_heads
+        self.layer_idx = layer_idx
+
+        self.norm = PMNetRMSNorm(self.hidden_size, eps=self.config.layer_norm_epsilon)
+
+        self.proj_q = nn.Linear(
+            self.hidden_size, self.num_read_heads * self.memory_size_real
+        )
+        self.proj_kv = nn.Linear(
+            self.memory_size_real, 2 * self.num_read_heads * self.memory_size_real
+        )
+        self.proj_out = nn.Linear(
+            self.num_read_heads * self.memory_size_real, self.hidden_size
+        )
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(
+        self,
+        hidden_states,
+        memory_states,
+        memory_embeddings,
+    ):
+        """
+        hidden_states: [..., hidden_size]
+        memory_states: [..., num_memory, memory_size]
+        memory_embedding: [num_memory, memory_size]
+        """
+
+        q = self.proj_q(self.norm(hidden_states)).to(torch.float32)
+        q = rearrange(q, "...  (h m) -> ... h m", h=self.num_read_heads)
+
+        memory_angle = memory_embeddings + memory_states
+        memory_angle = torch.remainder(memory_angle, 2 * torch.pi)
+
+        memory_states_real = torch.cat(
+            [
+                torch.sin(memory_angle),
+                torch.cos(memory_angle),
+            ],
+            dim=-1,
+        )
+        kv = self.proj_kv(memory_states_real)
+        kv = rearrange(
+            kv, "...  n (two h m) -> ... two h n m", two=2, h=self.num_read_heads
+        )
+        k, v = kv[..., 0, :, :, :].to(torch.float32), kv[..., 1, :, :, :]
+
+        scores = einsum(q, k, "... h m, ... h n m -> ... h n") / (
+            ((self.memory_size) ** 0.5)
+        )
+        scores = torch.softmax(scores, dim=-1).to(v.dtype)
+
+        out = einsum(scores, v, "... h n, ... h n m -> ... h m")
+        out = rearrange(out, "... h m -> ... (h m)")
+        return self.proj_out(out)
 
 
 class PMNetDecoderLayer(GradientCheckpointingLayer):
