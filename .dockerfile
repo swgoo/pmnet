@@ -1,9 +1,8 @@
-FROM huggingface/transformers-pytorch-gpu:latest
-WORKDIR /temp
-COPY requirements.txt .
-RUN pip install --upgrade-strategy only-if-needed -r requirements.txt
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
 RUN apt-get update && \
-    apt-get install -y git
-
-WORKDIR /workspace
+    apt-get install -y git \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /temp/requirements.txt
+RUN pip install --upgrade-strategy only-if-needed -r /temp/requirements.txt
 RUN rm -rf /temp/*
