@@ -36,6 +36,82 @@ from transformers.utils.generic import check_model_inputs, maybe_autocast
 from .configuration_pmnet import PMNetConfig
 
 
+class PMNetCache(DynamicCache):
+    """PMNet cache bundle.
+
+    - Decoder KV caching uses Hugging Face `DynamicCache` for correctness with
+      `cache_position` and masking utilities.
+    - PMNet recurrent memory states are stored separately in `memory_states` and
+      reordered alongside KV cache during beam search.
+    """
+
+    def __init__(
+        self,
+        config: PMNetConfig,
+        max_batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__(config=config)
+        self.config = config
+        self.max_batch_size = int(max_batch_size)
+        self.device = device
+        self.dtype = dtype
+        self.num_hidden_layers = config.num_hidden_layers
+
+        self.memory_states = []
+        memory_state_shared = None
+        for i in range(self.num_hidden_layers):
+            if i % self.config.memory_write_period == 0:
+                memory_state_shared = torch.zeros(
+                    self.max_batch_size,
+                    self.config.num_memory,
+                    self.config.memory_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            self.memory_states.append(memory_state_shared)
+
+    def to(
+        self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
+    ):
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.dtype
+        self.device = device
+        self.dtype = dtype
+        self.memory_states = self.memory_states.to(device=device, dtype=dtype)
+        # DynamicCache stores tensors internally; rely on parent implementation if available.
+        if hasattr(super(), "to"):
+            try:
+                super().to(device=device, dtype=dtype)
+            except TypeError:
+                # Older variants may not accept dtype.
+                super().to(device)
+        return self
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        super().reorder_cache(beam_idx)
+        beam_idx = beam_idx.to(self.memory_states.device)
+        for i in range(self.num_hidden_layers):
+            self.memory_states[i] = self.memory_states[i].index_select(0, beam_idx)
+        self.max_batch_size = int(self.memory_states[0].shape[0])
+        return self
+
+    def update_memory_state(self, layer_idx: int, new_state: torch.Tensor):
+        """Update PMNet Memory State for a specific layer.
+
+        new_state: [Batch, NumMemory, MemorySize]
+        """
+        self.memory_states[layer_idx] = new_state.to(
+            device=self.device, dtype=self.dtype
+        )
+
+    def get_memory_state(self, layer_idx: int) -> torch.Tensor:
+        return self.memory_states[layer_idx]
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class PMNetRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:

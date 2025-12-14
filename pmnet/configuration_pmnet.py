@@ -128,6 +128,10 @@ class PMNetConfig(PreTrainedConfig):
         num_attention_heads: Optional[int] = 32,
         num_key_value_heads: Optional[int] = 32,
         head_dim: Optional[int] = 128,
+        memory_size: Optional[int] = 64,
+        num_memory: Optional[int] = 32,
+        num_memory_heads: Optional[int] = 8,
+        memory_write_period: Optional[int] = 4,
         hidden_act: Optional[str] = "silu",
         max_position_embeddings: Optional[int] = 32768,
         initializer_range: Optional[float] = 0.02,
@@ -152,6 +156,11 @@ class PMNetConfig(PreTrainedConfig):
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window if self.use_sliding_window else None
         self.max_window_layers = max_window_layers
+
+        self.memory_size = memory_size
+        self.num_memory = num_memory
+        self.num_memory_heads = num_memory_heads
+        self.memory_write_period = memory_write_period
 
         # for backward compatibility
         if num_key_value_heads is None:
