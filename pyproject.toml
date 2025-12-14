@@ -1,0 +1,36 @@
+[project]
+name = "pmnet"
+version = "0.0.1"
+description = "PMNet"
+authors = [
+    { name = "Sungwoo Goo", email = "swgoo91@gmail.com" },
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.7.1",
+    "triton>=3.2.0",
+    "flash_attn>=2.8.3",
+    "causal-conv1d>=1.5.4",
+    "mamba-ssm>=2.2.5",
+    "einops",
+    "transformers>=4.57.3"
+]
+[project.urls]
+Repository = "https://github.com/swgoo/pmnet"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pmnet*"]
+exclude = ["tests*"]
+
+[build-system]
+requires = [
+    "setuptools>=61.0.0",
+    "wheel",
+    "torch",
+    "packaging",
+    "ninja",
+]
+build-backend = "setuptools.build_meta"
