@@ -35,6 +35,22 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs, maybe_autocast
 from .configuration_pmnet import PMNetConfig
+from torch.autograd import Function
+
+
+class StraightThroughEstimatorMask(Function):
+    @staticmethod
+    def forward(ctx, scores_soft, mask_hard):
+        return mask_hard
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_scores = grad_output
+        grad_mask = None
+        return grad_scores, grad_mask
+
+
+apply_ste_mask = StraightThroughEstimatorMask.apply
 
 
 class PMNetCache(DynamicCache):
@@ -421,6 +437,10 @@ class PMNetAttention(nn.Module):
         return attn_output, attn_weights
 
 
+def hook(grad, scale):
+    return grad / scale
+
+
 class PMNetMemoryWriteModule(nn.Module):
     def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
@@ -453,11 +473,13 @@ class PMNetMemoryWriteModule(nn.Module):
         memory_embeddings,
         cache_params: Optional[PMNetCache] = None,
     ):
+        dtype_original = hidden_states.dtype
+
         qv = self.proj_qv(self.norm(hidden_states))
         qv = rearrange(
             qv, "... (two h m) -> ... two h m", two=2, h=self.num_memory_heads
-        )
-        q, v = qv[..., 0, :, :].to(torch.float32), qv[..., 1, :, :]
+        ).to(torch.float32)
+        q, v = qv[..., 0, :, :], qv[..., 1, :, :]
 
         memory_real = torch.cat(
             [torch.sin(memory_embeddings), torch.cos(memory_embeddings)], dim=-1
@@ -466,60 +488,43 @@ class PMNetMemoryWriteModule(nn.Module):
         k = rearrange(k, "... n (h m) -> ... h n m", h=self.num_memory_heads)
 
         scores = (
-            (
-                einsum(q, k, "... h m, ... h n m -> ... h n")
-                / (self.memory_size_real) ** 0.5
-            )
-            .softmax(dim=-1)
-            .to(v.dtype)
+            einsum(q, k, "... h m, ... h n m -> ... h n") / self.memory_size_real**0.5
+        ).softmax(dim=-1)
+
+        write_hard = torch.zeros_like(scores).scatter_(
+            -1, torch.topk(scores, k=1, dim=-1)[1], 1.0
+        )
+        write_ste = apply_ste_mask(scores, write_hard)
+
+        theta = rearrange(v, "... h m -> ... (h m)")
+        theta = self.proj_out(theta)
+        theta = (
+            rearrange(theta, "... (h m) -> ... h m", h=self.num_memory_heads).tanh()
+            * torch.pi
         )
 
-        confidence, indices = torch.topk(scores, k=1, dim=-1)
+        theta_grid = (theta.unsqueeze(-2) * write_ste.unsqueeze(-1)).sum(-3)
 
-        delta = v * confidence
-
-        delta = rearrange(delta, "... h m -> ... (h m)")
-        delta = self.proj_out(delta)
-        delta = rearrange(delta, "... (h m) -> ... h m", h=self.num_memory_heads)
-        delta = torch.tanh(delta) * torch.pi
-
-        if self.training and delta.requires_grad:
-            S = delta.size(-3)
+        if self.training and theta_grid.requires_grad:
+            S = theta.size(-3)
             scale = S**0.5
+            hook_fn = functools.partial(hook, scale=scale)
+            theta_grid.register_hook(hook_fn)
 
-            def hook(grad):
-                return grad / scale
-
-            delta.register_hook(hook)
-
-        *prefix, _, _ = delta.shape
-        dtype_original = delta.dtype
-        delta = delta.to(torch.float32)
-
-        if cache_params is None:
-            update_grid = delta.new_zeros(*prefix, self.num_memory, self.memory_size)
-        else:
-            prev_memory = cache_params.get_memory_state(self.layer_idx)
-            update_grid = (
-                prev_memory.to(delta.device)
-                .to(torch.float32)
-                .clone()
-                .unsqueeze(-3)
-                .expand(*prefix, self.num_memory, self.memory_size)
-            )
-
-        indices_expanded = indices.expand(
-            *prefix, self.num_memory_heads, self.memory_size
-        )
-        update_grid.scatter_add_(-2, indices_expanded, delta)
-        current_cumulative = torch.cumsum(update_grid, dim=-3)
-        current_cumulative = torch.remainder(current_cumulative, 2 * torch.pi)
+        theta_cum = theta_grid.cumsum(dim=-3)
+        theta_cum = torch.remainder(theta_cum, 2 * torch.pi)
 
         if cache_params is not None:
-            cache_params.update_memory_state(
-                self.layer_idx, current_cumulative[..., -1, :, :]
+            theta_cum = (
+                cache_params.get_memory_state(self.layer_idx)
+                .to(theta_cum.device)
+                .to(theta_cum.dtype)
+                .unsqueeze(-3)
+                + theta_cum
             )
-        return current_cumulative.to(dtype_original)
+            theta_cum = torch.remainder(theta_cum, 2 * torch.pi)
+            cache_params.update_memory_state(self.layer_idx, theta_cum[..., -1, :, :])
+        return theta_cum.to(dtype_original)
 
 
 class PMNetMemoryReadModule(nn.Module):
@@ -581,10 +586,7 @@ class PMNetMemoryReadModule(nn.Module):
         k, v = kv[..., 0, :, :, :].to(torch.float32), kv[..., 1, :, :, :]
 
         scores = (
-            (
-                einsum(q, k, "... h m, ... h n m -> ... h n")
-                / (self.memory_size_real) ** 0.5
-            )
+            (einsum(q, k, "... h m, ... h n m -> ... h n") / self.memory_size_real**0.5)
             .softmax(dim=-1)
             .to(v.dtype)
         )
@@ -631,7 +633,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -732,7 +734,7 @@ class PMNetModel(PMNetPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[PMNetCache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
