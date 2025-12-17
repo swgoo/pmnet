@@ -126,12 +126,8 @@ class PMNetCache(DynamicCache):
         return self.memory_states_storage[block_idx]
 
 
-# @use_kernel_forward_from_hub("RMSNorm")
 class PMNetRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        Qwen3RMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -164,7 +160,7 @@ class PMNetMLP(nn.Module):
 
 
 class PMNetRotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+    inv_freq: torch.Tensor
 
     def __init__(self, config: PMNetConfig, device=None):
         super().__init__()
@@ -186,7 +182,6 @@ class PMNetRotaryEmbedding(nn.Module):
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
         inv_freq_expanded = (
             self.inv_freq[None, :, None]
@@ -219,7 +214,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# @use_kernel_func_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -291,9 +285,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-# @use_kernelized_func(apply_rotary_pos_emb)
 class PMNetAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
@@ -429,6 +421,7 @@ class PMNetMemoryWriteModule(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        memory_states: torch.Tensor,
         memory_embeddings: torch.Tensor,
         cache_params: Optional[PMNetCache] = None,
     ):
@@ -441,9 +434,8 @@ class PMNetMemoryWriteModule(nn.Module):
         q, v = qv[..., 0, :, :], qv[..., 1, :, :]
         q = q.unsqueeze(-2)
 
-        memory_geo = torch.cat(
-            [memory_embeddings.sin(), memory_embeddings.cos()], dim=-1
-        )
+        memory_angle = memory_states + memory_embeddings
+        memory_geo = torch.cat([memory_angle.sin(), memory_angle.cos()], dim=-1)
         k = self.proj_k(memory_geo).to(torch.float32).tanh() * torch.pi
         k = rearrange(k, "... n (h m) -> ... h n m", h=self.num_memory_heads)
 
@@ -526,8 +518,8 @@ class PMNetMemoryReadModule(nn.Module):
         q = self.proj_q(self.norm(hidden_states)).to(torch.float32).tanh() * torch.pi
         q = rearrange(q, "...  (h m) -> ... h 1 m", h=self.num_memory_heads)
 
-        memory_angles = memory_embeddings + memory_states
-        memory_geo = torch.cat([memory_angles.sin(), memory_angles.cos()], dim=-1)
+        memory_angle = memory_states + memory_embeddings
+        memory_geo = torch.cat([memory_angle.sin(), memory_angle.cos()], dim=-1)
         kv = self.proj_kv(memory_geo).to(torch.float32)
         kv = rearrange(
             kv, "...  n (two h m) -> ... two h n m", two=2, h=self.num_memory_heads
@@ -542,9 +534,7 @@ class PMNetMemoryReadModule(nn.Module):
 
 
 class PMNetDecoderLayer(GradientCheckpointingLayer):
-    def __init__(
-        self, config: PMNetConfig, layer_idx: int, memory_embeddings: nn.Parameter
-    ):
+    def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -558,19 +548,21 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         )
         self.attention_type = config.layer_types[layer_idx]
 
-        self.memory_embeddings = memory_embeddings
         self.memory_read_module = PMNetMemoryReadModule(
-            config=config, layer_idx=layer_idx
+            config=config,
+            layer_idx=layer_idx,
         )
         if layer_idx % config.memory_write_period == 0:
             self.memory_write_module = PMNetMemoryWriteModule(
-                config=config, layer_idx=layer_idx
+                config=config,
+                layer_idx=layer_idx,
             )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        memory_state: torch.Tensor,
+        memory_states: torch.Tensor,
+        memory_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[PMNetCache] = None,
@@ -594,6 +586,21 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+        # Memory Write
+        if hasattr(self, "memory_write_module"):
+            memory_states = memory_states + self.memory_write_module(
+                hidden_states,
+                memory_states,
+                memory_embeddings,
+                cache_params=past_key_values,
+            )
+
+        # Memory Read
+        hidden_states = hidden_states + self.memory_read_module(
+            hidden_states,
+            memory_states,
+            memory_embeddings,
+        )
 
         # Fully Connected
         residual = hidden_states
@@ -601,21 +608,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # Memory Write
-        if hasattr(self, "memory_write_module"):
-            memory_state = memory_state + self.memory_write_module(
-                hidden_states,
-                self.memory_embeddings,
-                cache_params=past_key_values,
-            )
-
-        # Memory Read
-        hidden_states = hidden_states + self.memory_read_module(
-            hidden_states,
-            memory_state,
-            self.memory_embeddings,
-        )
-        return hidden_states, memory_state
+        return hidden_states, memory_states
 
 
 class PMNetPreTrainedModel(PreTrainedModel):
@@ -646,18 +639,17 @@ class PMNetModel(PMNetPreTrainedModel):
             config.vocab_size, config.hidden_size, self.padding_idx
         )
 
+        self.shared_memory_embeddings = nn.ParameterList()
         layers = []
-        memory_embeddings = None
         for layer_idx in range(config.num_hidden_layers):
             if layer_idx % config.memory_write_period == 0:
-                memory_embeddings = nn.Parameter(
-                    torch.zeros(config.num_memory, config.memory_size)
-                )
-                nn.init.normal_(memory_embeddings, mean=0.0, std=0.02)
+                emb = nn.Parameter(torch.zeros(config.num_memory, config.memory_size))
+                nn.init.normal_(emb, mean=0.0, std=0.02)
+                self.shared_memory_embeddings.append(emb)
+
             layer = PMNetDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
-                memory_embeddings=memory_embeddings,
             )
             layers.append(layer)
 
@@ -732,9 +724,10 @@ class PMNetModel(PMNetPreTrainedModel):
                 )
 
         hidden_states = inputs_embeds
+        batch_size, _, _ = hidden_states.shape
         memory_states = torch.zeros(
-            hidden_states.size(0),
-            hidden_states.size(1),
+            batch_size,
+            1,
             self.config.num_memory,
             self.config.memory_size,
             device=hidden_states.device,
@@ -742,10 +735,13 @@ class PMNetModel(PMNetPreTrainedModel):
         )
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            memory_emb_idx = i // self.config.memory_write_period
+            memory_embeddings = self.shared_memory_embeddings[memory_emb_idx]
             hidden_states, memory_states = decoder_layer(
                 hidden_states,
                 memory_states,
+                memory_embeddings,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
