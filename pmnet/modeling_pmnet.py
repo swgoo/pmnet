@@ -25,16 +25,14 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
-from transformers.utils.generic import check_model_inputs
 from .configuration_pmnet import PMNetConfig
-from torch.autograd import Function
 
 
-class StraightThroughEstimatorMask(Function):
+class StraightThroughEstimatorMask(torch.autograd.Function):
     @staticmethod
     def forward(ctx, scores_soft, mask_hard):
         return mask_hard
@@ -66,9 +64,9 @@ class PMNetCache(DynamicCache):
         self.dtype = dtype
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.memory_states_storage = {}
+        self._memory_states_storage = {}
         for i in range(0, self.num_hidden_layers, config.memory_write_period):
-            self.memory_states_storage[i] = torch.zeros(
+            self._memory_states_storage[i] = torch.zeros(
                 self.max_batch_size,
                 self.config.num_memory,
                 self.config.memory_size,
@@ -91,8 +89,8 @@ class PMNetCache(DynamicCache):
         self.device = device
         self.dtype = dtype
 
-        for k, v in self.memory_states_storage.items():
-            self.memory_states_storage[k] = v.to(device=device, dtype=dtype)
+        for k, v in self._memory_states_storage.items():
+            self._memory_states_storage[k] = v.to(device=device, dtype=dtype)
 
         if hasattr(super(), "to"):
             try:
@@ -105,25 +103,35 @@ class PMNetCache(DynamicCache):
         super().reorder_cache(beam_idx)
         beam_idx = beam_idx.to(self.device)
 
-        for k, v in self.memory_states_storage.items():
-            self.memory_states_storage[k] = v.index_select(0, beam_idx)
+        for k, v in self._memory_states_storage.items():
+            self._memory_states_storage[k] = v.index_select(0, beam_idx)
 
-        if self.memory_states_storage:
-            first_key = next(iter(self.memory_states_storage))
-            self.max_batch_size = int(self.memory_states_storage[first_key].shape[0])
+        if self._memory_states_storage:
+            first_key = next(iter(self._memory_states_storage))
+            self.max_batch_size = int(self._memory_states_storage[first_key].shape[0])
 
         return self
 
     def update_memory_state(self, layer_idx: int, new_state: torch.Tensor):
         """Update PMNet Memory State for a specific block."""
+        # check new_state shape
+        expected_shape = (
+            self.max_batch_size,
+            self.config.num_memory,
+            self.config.memory_size,
+        )
+        if new_state.shape != expected_shape:
+            raise ValueError(
+                f"new_state shape {new_state.shape} does not match expected shape {expected_shape}"
+            )
         block_idx = self._get_block_idx(layer_idx)
-        self.memory_states_storage[block_idx] = new_state.to(
+        self._memory_states_storage[block_idx] = new_state.to(
             device=self.device, dtype=self.dtype
         )
 
     def get_memory_state(self, layer_idx: int) -> torch.Tensor:
         block_idx = self._get_block_idx(layer_idx)
-        return self.memory_states_storage[block_idx]
+        return self._memory_states_storage[block_idx]
 
 
 class PMNetRMSNorm(nn.Module):
@@ -402,6 +410,7 @@ class PMNetMemoryWriteModule(nn.Module):
         self.num_memory = config.num_memory
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.memory_cumsum = config.memory_cumsum
 
         self.norm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.proj_qv = nn.Linear(
@@ -461,7 +470,10 @@ class PMNetMemoryWriteModule(nn.Module):
             hook_fn = functools.partial(hook, scale=scale)
             theta_grid.register_hook(hook_fn)
 
-        theta_cum = theta_grid.cumsum(dim=-3)
+        if self.memory_cumsum:
+            theta_cum = theta_grid.cumsum(dim=-3)
+        else:
+            theta_cum = theta_grid
         theta_cum = torch.remainder(theta_cum, 2 * torch.pi)
 
         if cache_params is not None:

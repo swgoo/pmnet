@@ -58,6 +58,7 @@ class PMNetConfig(PretrainedConfig):
         max_window_layers: Optional[int] = 28,
         layer_types: Optional[list[str]] = None,
         attention_dropout: Optional[float] = 0.0,
+        memory_cumsum: bool = True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -89,6 +90,7 @@ class PMNetConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.memory_cumsum = memory_cumsum
 
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
