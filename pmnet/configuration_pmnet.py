@@ -42,7 +42,7 @@ class PMNetConfig(PretrainedConfig):
         head_dim: Optional[int] = 128,
         memory_size: Optional[int] = 64,
         num_memory: Optional[int] = 32,
-        num_memory_heads: Optional[int] = 8,
+        num_memory_read_heads: Optional[int] = 8,
         memory_write_period: Optional[int] = 4,
         hidden_act: Optional[str] = "silu",
         max_position_embeddings: Optional[int] = 32768,
@@ -73,7 +73,7 @@ class PMNetConfig(PretrainedConfig):
 
         self.memory_size = memory_size
         self.num_memory = num_memory
-        self.num_memory_heads = num_memory_heads
+        self.num_memory_read_heads = num_memory_read_heads
         self.memory_write_period = memory_write_period
 
         # for backward compatibility

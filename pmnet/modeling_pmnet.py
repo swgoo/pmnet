@@ -16,9 +16,6 @@ from transformers.masking_utils import (
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
 from transformers.modeling_outputs import (
@@ -65,16 +62,19 @@ class PMNetCache(DynamicCache):
         self.num_hidden_layers = config.num_hidden_layers
 
         self._memory_states_storage = {}
+        current_num_groups = 1
         for i in range(0, self.num_hidden_layers, config.memory_write_period):
             self._memory_states_storage[i] = torch.zeros(
                 self.max_batch_size,
+                current_num_groups,
                 self.config.num_memory,
                 self.config.memory_size,
                 device=self.device,
                 dtype=self.dtype,
             )
+            current_num_groups *= self.config.num_memory
 
-    def _get_block_idx(self, layer_idx: int) -> int:
+    def _get_memory_block_idx(self, layer_idx: int) -> int:
         return (
             layer_idx // self.config.memory_write_period
         ) * self.config.memory_write_period
@@ -112,26 +112,17 @@ class PMNetCache(DynamicCache):
 
         return self
 
-    def update_memory_state(self, layer_idx: int, new_state: torch.Tensor):
-        """Update PMNet Memory State for a specific block."""
-        # check new_state shape
-        expected_shape = (
-            self.max_batch_size,
-            self.config.num_memory,
-            self.config.memory_size,
-        )
-        if new_state.shape != expected_shape:
-            raise ValueError(
-                f"new_state shape {new_state.shape} does not match expected shape {expected_shape}"
-            )
-        block_idx = self._get_block_idx(layer_idx)
-        self._memory_states_storage[block_idx] = new_state.to(
+    def update_memory_state(
+        self, layer_idx: int, group_idx: int, new_state: torch.Tensor
+    ):
+        block_idx = self._get_memory_block_idx(layer_idx)
+        self._memory_states_storage[block_idx][:, group_idx, :, :] = new_state.to(
             device=self.device, dtype=self.dtype
         )
 
-    def get_memory_state(self, layer_idx: int) -> torch.Tensor:
-        block_idx = self._get_block_idx(layer_idx)
-        return self._memory_states_storage[block_idx]
+    def get_memory_state(self, layer_idx, group_idx):
+        block_idx = self._get_memory_block_idx(layer_idx)
+        return self._memory_states_storage[block_idx][:, group_idx, :, :]
 
 
 class PMNetRMSNorm(nn.Module):
@@ -405,7 +396,6 @@ class PMNetMemoryWriteModule(nn.Module):
     def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
         self.config = config
-        self.num_memory_heads = config.num_memory_heads
         self.memory_size = config.memory_size
         self.num_memory = config.num_memory
         self.hidden_size = config.hidden_size
@@ -413,16 +403,11 @@ class PMNetMemoryWriteModule(nn.Module):
         self.memory_cumsum = config.memory_cumsum
 
         self.norm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.proj_qv = nn.Linear(
-            self.hidden_size, 2 * self.num_memory_heads * self.memory_size
-        )
-        self.proj_k = nn.Linear(
-            2 * self.memory_size, self.num_memory_heads * self.memory_size
-        )
-        self.proj_out = nn.Linear(
-            self.num_memory_heads * self.memory_size,
-            self.num_memory_heads * self.memory_size,
-        )
+
+        self.proj_q = nn.Linear(self.hidden_size, self.memory_size)
+        self.proj_k = nn.Linear(2 * self.memory_size, self.memory_size)
+        self.proj_v = nn.Linear(self.hidden_size, self.memory_size)
+        self.proj_out = nn.Linear(self.memory_size, self.memory_size)
 
         nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj_out.bias)
@@ -431,62 +416,65 @@ class PMNetMemoryWriteModule(nn.Module):
         self,
         hidden_states: torch.Tensor,
         memory_states: torch.Tensor,
-        memory_embeddings: torch.Tensor,
+        active_embeddings: torch.Tensor,
+        memory_group_indices: torch.Tensor,
         cache_params: Optional[PMNetCache] = None,
     ):
         dtype_original = hidden_states.dtype
+        B, S, _ = hidden_states.shape
 
-        qv = self.proj_qv(self.norm(hidden_states)).to(torch.float32).tanh() * torch.pi
-        qv = rearrange(
-            qv, "... (two h m) -> ... two h m", h=self.num_memory_heads, two=2
-        )
-        q, v = qv[..., 0, :, :], qv[..., 1, :, :]
-        q = q.unsqueeze(-2)
+        hs = self.norm(hidden_states)
 
-        memory_angle = memory_states + memory_embeddings
+        q = self.proj_q(hs).to(torch.float32).unsqueeze(-2).tanh() * torch.pi
+
+        memory_angle = memory_states + active_embeddings
         memory_geo = torch.cat([memory_angle.sin(), memory_angle.cos()], dim=-1)
+
         k = self.proj_k(memory_geo).to(torch.float32).tanh() * torch.pi
-        k = rearrange(k, "... n (h m) -> ... h n m", h=self.num_memory_heads)
 
         scores = ((q - k).cos().sum(-1) / self.memory_size**0.5).softmax(dim=-1)
 
-        write_hard = torch.zeros_like(scores).scatter_(
-            -1, torch.topk(scores, k=1, dim=-1)[1], 1.0
-        )
+        prob, indices = torch.topk(scores, k=1, dim=-1)
+        indices = indices.squeeze(-1)
+
+        write_hard = torch.zeros_like(scores).scatter_(-1, indices.unsqueeze(-1), prob)
         write_ste = apply_ste_mask(scores, write_hard)
 
-        theta = rearrange(v, "... h m -> ... (h m)")
-        theta = self.proj_out(theta)
-        theta = (
-            rearrange(theta, "... (h m) -> ... h m", h=self.num_memory_heads).tanh()
-            * torch.pi
-        )
+        v = self.proj_v(hs).to(torch.float32)
+        theta = self.proj_out(v).tanh() * torch.pi
 
-        theta_grid = (theta.unsqueeze(-2) * write_ste.unsqueeze(-1)).sum(-3)
+        theta_grid = theta.unsqueeze(-2) * write_ste.unsqueeze(-1)
 
         if self.training and theta_grid.requires_grad:
-            S = theta.size(-3)
             scale = S**0.5
             hook_fn = functools.partial(hook, scale=scale)
             theta_grid.register_hook(hook_fn)
 
-        if self.memory_cumsum:
-            theta_cum = theta_grid.cumsum(dim=-3)
-        else:
-            theta_cum = theta_grid
-        theta_cum = torch.remainder(theta_cum, 2 * torch.pi)
+        read_state = torch.zeros_like(theta_grid)
+        unique_groups = torch.unique(memory_group_indices)
 
-        if cache_params is not None:
-            theta_cum = (
-                cache_params.get_memory_state(self.layer_idx)
-                .to(theta_cum.device)
-                .to(theta_cum.dtype)
-                .unsqueeze(-3)
-                + theta_cum
-            )
-            theta_cum = torch.remainder(theta_cum, 2 * torch.pi)
-            cache_params.update_memory_state(self.layer_idx, theta_cum[..., -1, :, :])
-        return theta_cum.to(dtype_original)
+        for g_idx in unique_groups:
+            mask = (memory_group_indices == g_idx).unsqueeze(-1).unsqueeze(-1)
+            masked_delta = theta_grid * mask
+
+            group_cumsum = torch.cumsum(masked_delta, dim=1)
+            group_cumsum = torch.remainder(group_cumsum, 2 * torch.pi)
+
+            if cache_params is not None:
+                prev_state = cache_params.get_memory_state(self.layer_idx, g_idx.item())
+                prev_state = prev_state.to(group_cumsum.device).unsqueeze(1)
+
+                group_cumsum = torch.remainder(group_cumsum + prev_state, 2 * torch.pi)
+
+                cache_params.update_memory_state(
+                    self.layer_idx, g_idx.item(), group_cumsum[:, -1]
+                )
+
+            read_state = read_state + (group_cumsum * mask)
+
+        next_group_indices = (memory_group_indices * self.num_memory) + indices
+
+        return read_state.to(dtype_original), next_group_indices
 
 
 class PMNetMemoryReadModule(nn.Module):
@@ -499,18 +487,18 @@ class PMNetMemoryReadModule(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.memory_size = config.memory_size
-        self.num_memory_heads = config.num_memory_heads
+        self.num_memory_read_heads = config.num_memory_read_heads
         self.layer_idx = layer_idx
 
         self.norm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.proj_q = nn.Linear(
-            self.hidden_size, self.num_memory_heads * self.memory_size
+            self.hidden_size, self.num_memory_read_heads * self.memory_size
         )
         self.proj_kv = nn.Linear(
-            2 * self.memory_size, 2 * self.num_memory_heads * self.memory_size
+            2 * self.memory_size, 2 * self.num_memory_read_heads * self.memory_size
         )
         self.proj_out = nn.Linear(
-            self.num_memory_heads * self.memory_size, self.hidden_size
+            self.num_memory_read_heads * self.memory_size, self.hidden_size
         )
         nn.init.normal_(self.proj_out.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj_out.bias)
@@ -519,22 +507,22 @@ class PMNetMemoryReadModule(nn.Module):
         self,
         hidden_states: torch.Tensor,
         memory_states: torch.Tensor,
-        memory_embeddings: torch.Tensor,
+        active_embeddings: torch.Tensor,
     ):
         """
         hidden_states: [..., hidden_size]
         memory_states: [..., num_memory, memory_size]
-        memory_embedding: [num_memory, memory_size]
+        active_embeddings: [..., num_memory, memory_size]
         """
 
         q = self.proj_q(self.norm(hidden_states)).to(torch.float32).tanh() * torch.pi
-        q = rearrange(q, "...  (h m) -> ... h 1 m", h=self.num_memory_heads)
+        q = rearrange(q, "...  (h m) -> ... h 1 m", h=self.num_memory_read_heads)
 
-        memory_angle = memory_states + memory_embeddings
+        memory_angle = memory_states + active_embeddings
         memory_geo = torch.cat([memory_angle.sin(), memory_angle.cos()], dim=-1)
         kv = self.proj_kv(memory_geo).to(torch.float32)
         kv = rearrange(
-            kv, "...  n (two h m) -> ... two h n m", two=2, h=self.num_memory_heads
+            kv, "...  n (two h m) -> ... two h n m", two=2, h=self.num_memory_read_heads
         )
         k, v = kv[..., 0, :, :, :].tanh() * torch.pi, kv[..., 1, :, :, :]
 
@@ -549,10 +537,8 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.layer_idx = layer_idx
         self.self_attn = PMNetAttention(config=config, layer_idx=layer_idx)
-
         self.mlp = PMNetMLP(config)
         self.input_layernorm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = PMNetRMSNorm(
@@ -574,7 +560,8 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         memory_states: torch.Tensor,
-        memory_embeddings: torch.Tensor,
+        active_embeddings: torch.Tensor,
+        memory_group_indices: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[PMNetCache] = None,
@@ -598,21 +585,26 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+
+        next_group_indices = None
         # Memory Write
         if hasattr(self, "memory_write_module"):
-            memory_states = memory_states + self.memory_write_module(
+            delta_memory, next_group_indices = self.memory_write_module(
                 hidden_states,
                 memory_states,
-                memory_embeddings,
+                active_embeddings,
+                memory_group_indices,
                 cache_params=past_key_values,
             )
+            memory_states = memory_states + delta_memory
 
         # Memory Read
-        hidden_states = hidden_states + self.memory_read_module(
+        memory_read_out = self.memory_read_module(
             hidden_states,
             memory_states,
-            memory_embeddings,
+            active_embeddings,
         )
+        hidden_states = hidden_states + memory_read_out
 
         # Fully Connected
         residual = hidden_states
@@ -620,7 +612,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, memory_states
+        return hidden_states, memory_states, next_group_indices
 
 
 class PMNetPreTrainedModel(PreTrainedModel):
@@ -652,12 +644,21 @@ class PMNetModel(PMNetPreTrainedModel):
         )
 
         self.shared_memory_embeddings = nn.ParameterList()
+        current_num_groups = 1
         layers = []
         for layer_idx in range(config.num_hidden_layers):
             if layer_idx % config.memory_write_period == 0:
-                emb = nn.Parameter(torch.zeros(config.num_memory, config.memory_size))
+                memory_block_idx = layer_idx // config.memory_write_period
+                emb = nn.Parameter(
+                    torch.zeros(
+                        current_num_groups,
+                        config.num_memory,
+                        config.memory_size,
+                    )
+                )
                 nn.init.normal_(emb, mean=0.0, std=0.02)
                 self.shared_memory_embeddings.append(emb)
+                current_num_groups *= config.num_memory
 
             layer = PMNetDecoderLayer(
                 config=config,
@@ -736,24 +737,42 @@ class PMNetModel(PMNetPreTrainedModel):
                 )
 
         hidden_states = inputs_embeds
-        batch_size, _, _ = hidden_states.shape
+        batch_size, seq_len, _ = hidden_states.shape
         memory_states = torch.zeros(
             batch_size,
-            1,
+            seq_len,
             self.config.num_memory,
             self.config.memory_size,
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        current_group_indices = torch.zeros(
+            batch_size,
+            seq_len,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+        next_block_group_indices = None
+
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            if i % self.config.memory_write_period == 0:
+                if i > 0 and next_block_group_indices is not None:
+                    current_group_indices = next_block_group_indices
             memory_emb_idx = i // self.config.memory_write_period
-            memory_embeddings = self.shared_memory_embeddings[memory_emb_idx]
-            hidden_states, memory_states = decoder_layer(
+            memory_embeddings_pool = self.shared_memory_embeddings[memory_emb_idx]
+            flat_indices = current_group_indices.view(-1)
+            active_embeddings = memory_embeddings_pool.index_select(0, flat_indices)
+            active_embeddings = active_embeddings.view(
+                batch_size, seq_len, self.config.num_memory, self.config.memory_size
+            )
+
+            hidden_states, memory_states, new_next_indices = decoder_layer(
                 hidden_states,
                 memory_states,
-                memory_embeddings,
+                active_embeddings,
+                current_group_indices,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
@@ -762,6 +781,8 @@ class PMNetModel(PMNetPreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
+            if new_next_indices is not None:
+                next_block_group_indices = new_next_indices
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
