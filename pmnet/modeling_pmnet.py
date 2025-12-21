@@ -416,7 +416,7 @@ class PMNetMemoryWriteModule(nn.Module):
         self,
         hidden_states: torch.Tensor,
         memory_states: torch.Tensor,
-        active_embeddings: torch.Tensor,
+        active_memory_embeddings: torch.Tensor,
         memory_group_indices: torch.Tensor,
         cache_params: Optional[PMNetCache] = None,
     ):
@@ -424,31 +424,22 @@ class PMNetMemoryWriteModule(nn.Module):
         B, S, _ = hidden_states.shape
 
         hs = self.norm(hidden_states)
-
         q = self.proj_q(hs).to(torch.float32).unsqueeze(-2).tanh() * torch.pi
+        v = self.proj_v(hs).to(torch.float32)
 
-        memory_angle = memory_states + active_embeddings
+        memory_angle = memory_states + active_memory_embeddings
         memory_geo = torch.cat([memory_angle.sin(), memory_angle.cos()], dim=-1)
-
         k = self.proj_k(memory_geo).to(torch.float32).tanh() * torch.pi
 
         scores = ((q - k).cos().sum(-1) / self.memory_size**0.5).softmax(dim=-1)
 
         prob, indices = torch.topk(scores, k=1, dim=-1)
-        indices = indices.squeeze(-1)
 
-        write_hard = torch.zeros_like(scores).scatter_(-1, indices.unsqueeze(-1), prob)
+        write_hard = torch.zeros_like(scores).scatter_(-1, indices, prob)
         write_ste = apply_ste_mask(scores, write_hard)
 
-        v = self.proj_v(hs).to(torch.float32)
         theta = self.proj_out(v).tanh() * torch.pi
-
         theta_grid = theta.unsqueeze(-2) * write_ste.unsqueeze(-1)
-
-        if self.training and theta_grid.requires_grad:
-            scale = S**0.5
-            hook_fn = functools.partial(hook, scale=scale)
-            theta_grid.register_hook(hook_fn)
 
         read_state = torch.zeros_like(theta_grid)
         unique_groups = torch.unique(memory_group_indices)
@@ -456,14 +447,21 @@ class PMNetMemoryWriteModule(nn.Module):
         for g_idx in unique_groups:
             mask = (memory_group_indices == g_idx).unsqueeze(-1).unsqueeze(-1)
             masked_delta = theta_grid * mask
-
-            group_cumsum = torch.cumsum(masked_delta, dim=1)
-            group_cumsum = torch.remainder(group_cumsum, 2 * torch.pi)
+            if self.training and masked_delta.requires_grad:
+                S_eff = mask.sum(dim=1, keepdim=True)
+                S_eff = S_eff.clamp(min=1.0)
+                scale = S_eff**0.5
+                hook_fn = functools.partial(hook, scale=scale)
+                masked_delta.register_hook(hook_fn)
+            if self.memory_cumsum:  # for ablation study
+                group_cumsum = torch.cumsum(masked_delta, dim=1)
+                group_cumsum = torch.remainder(group_cumsum, 2 * torch.pi)
+            else:
+                group_cumsum = masked_delta
 
             if cache_params is not None:
                 prev_state = cache_params.get_memory_state(self.layer_idx, g_idx.item())
                 prev_state = prev_state.to(group_cumsum.device).unsqueeze(1)
-
                 group_cumsum = torch.remainder(group_cumsum + prev_state, 2 * torch.pi)
 
                 cache_params.update_memory_state(
@@ -472,7 +470,9 @@ class PMNetMemoryWriteModule(nn.Module):
 
             read_state = read_state + (group_cumsum * mask)
 
-        next_group_indices = (memory_group_indices * self.num_memory) + indices
+        next_group_indices = (memory_group_indices * self.num_memory) + indices.squeeze(
+            -1
+        )
 
         return read_state.to(dtype_original), next_group_indices
 
@@ -560,7 +560,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         memory_states: torch.Tensor,
-        active_embeddings: torch.Tensor,
+        active_memory_embeddings: torch.Tensor,
         memory_group_indices: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -569,7 +569,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -586,13 +586,13 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = residual + hidden_states
 
-        next_group_indices = None
+        next_memory_group_indices = None
         # Memory Write
         if hasattr(self, "memory_write_module"):
-            delta_memory, next_group_indices = self.memory_write_module(
+            delta_memory, next_memory_group_indices = self.memory_write_module(
                 hidden_states,
                 memory_states,
-                active_embeddings,
+                active_memory_embeddings,
                 memory_group_indices,
                 cache_params=past_key_values,
             )
@@ -602,7 +602,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         memory_read_out = self.memory_read_module(
             hidden_states,
             memory_states,
-            active_embeddings,
+            active_memory_embeddings,
         )
         hidden_states = hidden_states + memory_read_out
 
@@ -612,7 +612,7 @@ class PMNetDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, memory_states, next_group_indices
+        return hidden_states, memory_states, next_memory_group_indices
 
 
 class PMNetPreTrainedModel(PreTrainedModel):
@@ -648,7 +648,6 @@ class PMNetModel(PMNetPreTrainedModel):
         layers = []
         for layer_idx in range(config.num_hidden_layers):
             if layer_idx % config.memory_write_period == 0:
-                memory_block_idx = layer_idx // config.memory_write_period
                 emb = nn.Parameter(
                     torch.zeros(
                         current_num_groups,
@@ -746,33 +745,35 @@ class PMNetModel(PMNetPreTrainedModel):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        current_group_indices = torch.zeros(
+        current_memory_group_indices = torch.zeros(
             batch_size,
             seq_len,
             dtype=torch.long,
             device=hidden_states.device,
         )
-        next_block_group_indices = None
+        next_memory_group_indices = None
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if i % self.config.memory_write_period == 0:
-                if i > 0 and next_block_group_indices is not None:
-                    current_group_indices = next_block_group_indices
+                if i > 0 and next_memory_group_indices is not None:
+                    current_memory_group_indices = next_memory_group_indices
             memory_emb_idx = i // self.config.memory_write_period
             memory_embeddings_pool = self.shared_memory_embeddings[memory_emb_idx]
-            flat_indices = current_group_indices.view(-1)
-            active_embeddings = memory_embeddings_pool.index_select(0, flat_indices)
-            active_embeddings = active_embeddings.view(
+            flat_indices = current_memory_group_indices.view(-1)
+            active_memory_embeddings = memory_embeddings_pool.index_select(
+                0, flat_indices
+            )
+            active_memory_embeddings = active_memory_embeddings.view(
                 batch_size, seq_len, self.config.num_memory, self.config.memory_size
             )
 
             hidden_states, memory_states, new_next_indices = decoder_layer(
                 hidden_states,
                 memory_states,
-                active_embeddings,
-                current_group_indices,
+                active_memory_embeddings,
+                current_memory_group_indices,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
@@ -782,7 +783,7 @@ class PMNetModel(PMNetPreTrainedModel):
                 **kwargs,
             )
             if new_next_indices is not None:
-                next_block_group_indices = new_next_indices
+                next_memory_group_indices = new_next_indices
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
