@@ -1,6 +1,6 @@
 [project]
 name = "pmnet"
-version = "0.1.0"
+version = "0.1.1"
 description = "PMNet"
 authors = [
     { name = "Sungwoo Goo", email = "swgoo91@gmail.com" },
