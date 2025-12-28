@@ -29,21 +29,6 @@ from transformers.utils import TransformersKwargs
 from .configuration_pmnet import PMNetConfig
 
 
-class StraightThroughEstimatorMask(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, scores_soft, mask_hard):
-        return mask_hard
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_scores = grad_output
-        grad_mask = None
-        return grad_scores, grad_mask
-
-
-apply_ste_mask = StraightThroughEstimatorMask.apply
-
-
 class PMNetCache(DynamicCache):
     """PMNet cache bundle."""
 
@@ -421,10 +406,6 @@ class PMNetAttention(nn.Module):
         return attn_output, attn_weights
 
 
-def hook(grad, scale):
-    return grad / scale
-
-
 class PMNetMemoryWriteModule(nn.Module):
     def __init__(self, config: PMNetConfig, layer_idx: int):
         super().__init__()
@@ -471,16 +452,13 @@ class PMNetMemoryWriteModule(nn.Module):
 
         scores = ((q - k).cos().sum(-1) / self.memory_size**0.5).softmax(dim=-1)
 
-        prob, indices = torch.topk(scores, k=1, dim=-1)
+        _, indices = torch.topk(scores, k=1, dim=-1)
         next_group_indices = (memory_group_indices * self.num_memory) + indices.squeeze(
             -1
         )
 
-        write_hard = torch.zeros_like(scores).scatter_(-1, indices, prob)
-        write_ste = apply_ste_mask(scores, write_hard)
-
         theta = self.proj_out(v).tanh() * torch.pi
-        theta_grid = einsum(theta, write_ste, "... s m, ... s n -> ... s n m")
+        theta_grid = einsum(theta, scores, "... s m, ... s n -> ... s n m")
 
         if not self.memory_cumsum:
             return theta_grid.to(dtype_original), next_group_indices
@@ -506,14 +484,12 @@ class PMNetMemoryWriteModule(nn.Module):
         counts_sorted = seg_lens.repeat_interleave(seg_lens)
 
         if self.training and theta_grid.requires_grad:
-            # P -> [B, S] 복구 필요
             counts_flat = torch.empty(P, device=device, dtype=torch.long)
             counts_flat[perm] = counts_sorted
             scale = (
                 counts_flat.view(B, S, 1, 1).to(theta_grid.dtype).sqrt().clamp(min=1.0)
             )
 
-            # STE Scaling Trick
             theta_grid = theta_grid / scale + (theta_grid - theta_grid / scale).detach()
 
         delta_flat = theta_grid.reshape(P, self.num_memory, self.memory_size)
