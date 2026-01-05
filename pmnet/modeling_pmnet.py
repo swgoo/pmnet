@@ -1,5 +1,4 @@
 from collections.abc import Callable
-import functools
 from typing import Iterable, Optional, Union
 
 from einops import einsum, rearrange
@@ -30,7 +29,6 @@ from .configuration_pmnet import PMNetConfig
 
 
 class PMNetCache(DynamicCache):
-    """PMNet cache bundle."""
 
     def __init__(
         self,
@@ -46,101 +44,69 @@ class PMNetCache(DynamicCache):
             offload_only_non_sliding=offload_only_non_sliding,
         )
         self.config = config
-        self.num_hidden_layers = config.num_hidden_layers
-
         self._memory_states_storage: dict[int, torch.Tensor] = {}
-        for layer_idx in range(0, self.num_hidden_layers, config.memory_write_period):
-            block_idx = self._get_memory_block_idx(layer_idx)
-            self._ensure_storage(block_idx, 1)
 
     def _get_memory_block_idx(self, layer_idx: int) -> int:
         return (
             layer_idx // self.config.memory_write_period
         ) * self.config.memory_write_period
 
-    def _ensure_storage(self, block_idx: int, batch_size: int):
-        write_step = block_idx // self.config.memory_write_period
-        num_groups = self.config.num_memory**write_step
-
-        if block_idx not in self._memory_states_storage:
-            self._memory_states_storage[block_idx] = torch.zeros(
-                batch_size,
-                num_groups,
-                self.config.num_memory,
-                self.config.memory_size,
-                device=self.device,
-                dtype=self.dtype,
-            )
-        elif self._memory_states_storage[block_idx].shape[0] < batch_size:
-            old_storage = self._memory_states_storage[block_idx]
-            current_B = old_storage.shape[0]
-            missing_B = batch_size - current_B
-
-            new_part = torch.zeros(
-                missing_B,
-                num_groups,
-                self.config.num_memory,
-                self.config.memory_size,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            self._memory_states_storage[block_idx] = torch.cat(
-                [old_storage, new_part], dim=0
-            )
-
-    def to(
-        self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
-    ):
-        if device is None:
-            device = self.device
-        if dtype is None:
-            dtype = self.dtype
-        self.device = device
-        self.dtype = dtype
-
-        for k, v in self._memory_states_storage.items():
-            self._memory_states_storage[k] = v.to(device=device, dtype=dtype)
-
-        if hasattr(super(), "to"):
-            try:
-                super().to(device=device, dtype=dtype)
-            except TypeError:
-                super().to(device)
-        return self
-
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        super().reorder_cache(beam_idx)
-        beam_idx = beam_idx.to(self.device)
-
-        for k, v in self._memory_states_storage.items():
-            self._memory_states_storage[k] = v.index_select(0, beam_idx)
-
-        if self._memory_states_storage:
-            first_key = next(iter(self._memory_states_storage))
-            self.max_batch_size = int(self._memory_states_storage[first_key].shape[0])
-
-        return self
+    def _get_num_memory_groups(self, layer_idx: int) -> int:
+        write_step = layer_idx // self.config.memory_write_period
+        return self.config.num_memory**write_step
 
     def get_memory_state(
         self,
         layer_idx: int,
         batch_indices: torch.LongTensor,
-        group_indices: torch.LongTensor,
-    ) -> torch.Tensor:
+        memory_group_indices: torch.LongTensor,
+    ) -> torch.Tensor | None:
+
         block_idx = self._get_memory_block_idx(layer_idx)
-        storage = self._memory_states_storage[block_idx]
-        return storage[batch_indices, group_indices]
+        if block_idx in self._memory_states_storage:
+            storage = self._memory_states_storage[block_idx]
+            return storage[batch_indices, memory_group_indices]
+        else:
+            return None
 
     def update_memory_state(
         self,
         layer_idx: int,
         batch_indices: torch.LongTensor,
-        group_indices: torch.LongTensor,
+        memory_group_indices: torch.LongTensor,
         new_state: torch.Tensor,
     ):
         block_idx = self._get_memory_block_idx(layer_idx)
-        storage = self._memory_states_storage[block_idx]
-        storage[batch_indices, group_indices] = new_state.to(storage.dtype)
+        storage = (
+            self._memory_states_storage[block_idx]
+            if block_idx in self._memory_states_storage
+            else None
+        )
+        if storage is None:
+            storage = torch.zeros(
+                batch_indices.max().item() + 1,
+                self._get_num_memory_groups(layer_idx),
+                self.config.num_memory,
+                self.config.memory_size,
+                device=new_state.device,
+                dtype=new_state.dtype,
+            )
+            self._memory_states_storage[block_idx] = storage
+
+        if storage.shape[0] < batch_indices.max().item() + 1:
+            new_size = batch_indices.max().item() + 1
+            pad_size = new_size - storage.shape[0]
+            pad_tensor = torch.zeros(
+                pad_size,
+                storage.shape[1],
+                storage.shape[2],
+                device=storage.device,
+                dtype=storage.dtype,
+            )
+            storage = torch.cat([storage, pad_tensor], dim=0)
+            self._memory_states_storage[block_idx] = storage
+
+        storage[batch_indices, memory_group_indices] = new_state.to(storage.dtype)
 
 
 class PMNetRMSNorm(nn.Module):
@@ -440,7 +406,6 @@ class PMNetMemoryWriteModule(nn.Module):
         dtype_original = hidden_states.dtype
         device = hidden_states.device
         B, S, _ = hidden_states.shape
-        two_pi = 2 * torch.pi
 
         hs = self.norm(hidden_states)
         q = self.proj_q(hs).to(torch.float32).unsqueeze(-2).tanh() * torch.pi
@@ -523,7 +488,15 @@ class PMNetMemoryWriteModule(nn.Module):
 
             prev_seg_state = cache_params.get_memory_state(
                 self.layer_idx, seg_batch, seg_group
-            ).to(dtype=seg_cumsum_sorted.dtype)
+            )
+            if prev_seg_state is None:
+                prev_seg_state = torch.zeros(
+                    len(seg_batch),
+                    self.num_memory,
+                    self.memory_size,
+                    device=device,
+                    dtype=seg_cumsum_sorted.dtype,
+                )
 
             prev_expanded = prev_seg_state.repeat_interleave(seg_lens, dim=0)
             seg_cumsum_sorted = seg_cumsum_sorted + prev_expanded
@@ -532,7 +505,7 @@ class PMNetMemoryWriteModule(nn.Module):
                 [start_pos[1:] - 1, torch.tensor([P - 1], device=device)]
             )
             new_seg_state = seg_cumsum_sorted[end_pos]
-            new_seg_state = torch.remainder(new_seg_state, two_pi)
+            new_seg_state = torch.remainder(new_seg_state, 2 * torch.pi)
 
             cache_params.update_memory_state(
                 self.layer_idx, seg_batch, seg_group, new_seg_state
@@ -541,7 +514,7 @@ class PMNetMemoryWriteModule(nn.Module):
         read_state_flat = torch.empty_like(seg_cumsum_sorted)
         read_state_flat[perm] = seg_cumsum_sorted
         read_state = read_state_flat.view(B, S, self.num_memory, self.memory_size)
-        read_state = torch.remainder(read_state, two_pi)
+        read_state = torch.remainder(read_state, 2 * torch.pi)
         return read_state.to(dtype_original), next_group_indices
 
 
@@ -764,9 +737,6 @@ class PMNetModel(PMNetPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = PMNetCache(
                 config=self.config,
-                max_batch_size=inputs_embeds.size(0),
-                device=inputs_embeds.device,
-                dtype=inputs_embeds.dtype,
             )
 
         if cache_position is None:
