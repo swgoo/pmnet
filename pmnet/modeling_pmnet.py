@@ -61,13 +61,22 @@ class PMNetCache(DynamicCache):
         batch_indices: torch.LongTensor,
         memory_group_indices: torch.LongTensor,
     ) -> torch.Tensor | None:
+        assert batch_indices.size(0) == memory_group_indices.size(
+            0
+        ), "Batch indices and memory group indices must have the same length."
 
         block_idx = self._get_memory_block_idx(layer_idx)
         if block_idx in self._memory_states_storage:
             storage = self._memory_states_storage[block_idx]
             return storage[batch_indices, memory_group_indices]
         else:
-            return None
+            return torch.zeros(
+                batch_indices.size(0),
+                self.config.num_memory,
+                self.config.memory_size,
+                device=batch_indices.device,
+                dtype=torch.float32,
+            )
 
     def update_memory_state(
         self,
@@ -76,6 +85,10 @@ class PMNetCache(DynamicCache):
         memory_group_indices: torch.LongTensor,
         new_state: torch.Tensor,
     ):
+        assert batch_indices.size(0) == memory_group_indices.size(
+            0
+        ), "Batch indices and memory group indices must have the same length."
+
         block_idx = self._get_memory_block_idx(layer_idx)
         storage = (
             self._memory_states_storage[block_idx]
@@ -89,19 +102,17 @@ class PMNetCache(DynamicCache):
                 self.config.num_memory,
                 self.config.memory_size,
                 device=new_state.device,
-                dtype=new_state.dtype,
+                dtype=torch.float32,
             )
             self._memory_states_storage[block_idx] = storage
 
         if storage.shape[0] < batch_indices.max().item() + 1:
-            new_size = batch_indices.max().item() + 1
-            pad_size = new_size - storage.shape[0]
+            pad_size = batch_indices.max().item() + 1 - storage.shape[0]
             pad_tensor = torch.zeros(
                 pad_size,
-                storage.shape[1],
-                storage.shape[2],
+                *storage.shape[1:],
                 device=storage.device,
-                dtype=storage.dtype,
+                dtype=torch.float32,
             )
             storage = torch.cat([storage, pad_tensor], dim=0)
             self._memory_states_storage[block_idx] = storage
@@ -380,10 +391,10 @@ class PMNetMemoryWriteModule(nn.Module):
         self.num_memory = config.num_memory
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.memory_cumsum = config.memory_cumsum
 
-        write_step = layer_idx // config.memory_write_period
-        self.total_groups_in_layer = self.num_memory**write_step
+        self.num_memory_groups_in_layer = self.num_memory ** (
+            layer_idx // config.memory_write_period
+        )
 
         self.norm = PMNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -425,7 +436,7 @@ class PMNetMemoryWriteModule(nn.Module):
         theta = self.proj_out(v).tanh() * torch.pi
         theta_grid = einsum(theta, scores, "... s m, ... s n -> ... s n m")
 
-        if not self.memory_cumsum:
+        if not self.config.memory_cumsum:
             return theta_grid.to(dtype_original), next_group_indices
 
         P = B * S
@@ -433,7 +444,7 @@ class PMNetMemoryWriteModule(nn.Module):
         flat_batch = torch.arange(B, device=device, dtype=torch.long).repeat_interleave(
             S
         )  # [B*S]
-        sort_key = flat_batch * self.total_groups_in_layer + flat_group
+        sort_key = flat_batch * self.num_memory_groups_in_layer + flat_group
         perm = torch.argsort(sort_key, stable=True)  # [B*S]
         key_sorted = sort_key[perm]
 
@@ -483,20 +494,12 @@ class PMNetMemoryWriteModule(nn.Module):
 
         if cache_params is not None:
             seg_keys = key_sorted[start_pos]
-            seg_batch = (seg_keys // self.total_groups_in_layer).to(torch.long)
-            seg_group = (seg_keys % self.total_groups_in_layer).to(torch.long)
+            seg_batch = (seg_keys // self.num_memory_groups_in_layer).to(torch.long)
+            seg_group = (seg_keys % self.num_memory_groups_in_layer).to(torch.long)
 
             prev_seg_state = cache_params.get_memory_state(
                 self.layer_idx, seg_batch, seg_group
             )
-            if prev_seg_state is None:
-                prev_seg_state = torch.zeros(
-                    len(seg_batch),
-                    self.num_memory,
-                    self.memory_size,
-                    device=device,
-                    dtype=seg_cumsum_sorted.dtype,
-                )
 
             prev_expanded = prev_seg_state.repeat_interleave(seg_lens, dim=0)
             seg_cumsum_sorted = seg_cumsum_sorted + prev_expanded
@@ -684,7 +687,7 @@ class PMNetModel(PMNetPreTrainedModel):
             config.vocab_size, config.hidden_size, self.padding_idx
         )
 
-        self.shared_memory_embeddings = nn.ParameterList()
+        self.memory_embeddings = nn.ParameterList()
         current_num_groups = 1
         layers = []
         for layer_idx in range(config.num_hidden_layers):
@@ -697,7 +700,7 @@ class PMNetModel(PMNetPreTrainedModel):
                     )
                 )
                 nn.init.normal_(emb, mean=0.0, std=0.02)
-                self.shared_memory_embeddings.append(emb)
+                self.memory_embeddings.append(emb)
                 current_num_groups *= config.num_memory
 
             layer = PMNetDecoderLayer(
@@ -798,7 +801,7 @@ class PMNetModel(PMNetPreTrainedModel):
                 if i > 0 and next_memory_group_indices is not None:
                     current_memory_group_indices = next_memory_group_indices
             memory_emb_idx = i // self.config.memory_write_period
-            memory_embeddings_pool = self.shared_memory_embeddings[memory_emb_idx]
+            memory_embeddings_pool = self.memory_embeddings[memory_emb_idx]
             flat_indices = current_memory_group_indices.view(-1)
             active_memory_embeddings = memory_embeddings_pool.index_select(
                 0, flat_indices
