@@ -4,6 +4,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from pmnet.modeling_pmnet import PMNetForCausalLM
+from pmnet.tokenizer import ByteTokenizer
 
 # -----------------------------------------------------------------------------
 # 설정 (본인 환경에 맞게 수정하세요)
@@ -11,54 +12,6 @@ from pmnet.modeling_pmnet import PMNetForCausalLM
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEQ_LEN = 8192  # 모델 학습 시 사용한 Context Length (또는 Sliding Window 크기보다 크게)
 NUM_BOOKS = 10  # 평가할 책의 권수 (전체 다 하면 오래 걸리니 10~50권 정도 추천)
-
-
-class ByteTokenizer:
-    def __init__(self, special_tokens: dict[str, int] | None = None):
-        self.vocab_size = 256
-        self.pad_idx = 0
-        self.bos_idx = 254
-        self.eos_idx = 255
-        self.special_tokens = special_tokens or {}
-
-        # EOS 정보 등 표준 인터페이스용 속성 추가
-        self.eos_token_id = self.eos_idx
-        self.bos_token_id = self.bos_idx
-
-        # UTF-8 안전 범위 검사
-        for idx in [self.bos_idx, self.eos_idx] + list(self.special_tokens.values()):
-            assert (
-                0xF8 <= idx <= 0xFF
-            ), f"Special token index {idx}는 UTF-8 안전 범위를 벗어납니다."
-
-    def __call__(self, seqs: list[str] | str, **kwargs):
-        """datasets.map의 표준 인터페이스 대응"""
-        if isinstance(seqs, str):
-            seqs = [seqs]
-        return {"input_ids": self.encode(seqs, **kwargs)}
-
-    def encode(
-        self, seqs: list[str], add_bos=False, add_eos=False, return_tensors=True
-    ) -> list[list[int]]:
-        total_outputs = []
-        for text in seqs:
-            # bytes는 그 자체로 [0~255] 정수 리스트처럼 동작합니다.
-            text_byte = list(text.encode("utf-8"))
-
-            if add_bos:
-                text_byte = [self.bos_idx] + text_byte
-            if add_eos:
-                text_byte = text_byte + [self.eos_idx]
-
-            total_outputs.append(text_byte)
-        return torch.tensor(total_outputs, dtype=torch.long)
-
-    def decode(self, tokens: list[int] | torch.Tensor, **kwargs):
-        if isinstance(tokens, torch.Tensor):
-            tokens = tokens.tolist()
-        if "errors" not in kwargs:
-            kwargs["errors"] = "ignore"
-        return bytes(tokens).decode("utf-8", **kwargs)
 
 
 def evaluate_pg19(model, tokenizer):

@@ -4,7 +4,7 @@ import os
 import torch
 from transformers import AutoTokenizer
 from datasets import load_dataset
-from pmnet import PMNetForCausalLM, PMNetConfig
+from pmnet import PMNetForCausalLM, PMNetConfig, ByteTokenizer
 
 CKPT_PATH = "../ckpts/byte_batch48_28000"
 DATA_PROCESS_BATCH_SIZE = 1000
@@ -13,58 +13,11 @@ SEQ_LENGTH = 512 * 1024
 DATASET_ID = "emozilla/pg19"
 DATA_SPLIT = "test"
 NUM_EVAL_SAMPLES = 4
-loss_save_dir = "../data/byte_losses_pg19_512k"
+loss_save_dir = "../data/byte_losses_pg19_512k_new_tokenizer"
 
 os.makedirs(loss_save_dir, exist_ok=True)
 
 import torch
-
-
-class ByteTokenizer:
-    def __init__(self, special_tokens: dict[str, int] | None = None):
-        self.vocab_size = 256
-        self.pad_idx = 0
-        self.bos_idx = 254
-        self.eos_idx = 255
-        self.special_tokens = special_tokens or {}
-
-        # EOS 정보 등 표준 인터페이스용 속성 추가
-        self.eos_token_id = self.eos_idx
-        self.bos_token_id = self.bos_idx
-
-        # UTF-8 안전 범위 검사
-        for idx in [self.bos_idx, self.eos_idx] + list(self.special_tokens.values()):
-            assert (
-                0xF8 <= idx <= 0xFF
-            ), f"Special token index {idx}는 UTF-8 안전 범위를 벗어납니다."
-
-    def __call__(self, seqs: list[str] | str, **kwargs):
-        """datasets.map의 표준 인터페이스 대응"""
-        if isinstance(seqs, str):
-            seqs = [seqs]
-        return {"input_ids": self.encode(seqs, **kwargs)}
-
-    def encode(self, seqs: list[str], add_bos=False, add_eos=False) -> list[list[int]]:
-        total_outputs = []
-        for text in seqs:
-            # bytes는 그 자체로 [0~255] 정수 리스트처럼 동작합니다.
-            text_byte = list(text.encode("utf-8"))
-
-            if add_bos:
-                text_byte = [self.bos_idx] + text_byte
-            if add_eos:
-                text_byte = text_byte + [self.eos_idx]
-
-            total_outputs.append(text_byte)
-        return total_outputs
-
-    def decode(self, tokens: list[int] | torch.Tensor, **kwargs):
-        if isinstance(tokens, torch.Tensor):
-            tokens = tokens.tolist()
-        if "errors" not in kwargs:
-            kwargs["errors"] = "ignore"
-        return bytes(tokens).decode("utf-8", **kwargs)
-
 
 tokenizer = ByteTokenizer()
 
