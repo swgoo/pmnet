@@ -1,5 +1,6 @@
 data/**
 ckpts/**
+*.safetensors
 # temporary path
 **/.tmp
 

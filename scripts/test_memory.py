@@ -3,9 +3,10 @@ from itertools import chain
 import os
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
-from pmnet import PMNetForCausalLM, PMNetConfig, ByteTokenizer
+
+# from pmnet import PMNetForCausalLM, PMNetConfig, ByteTokenizer
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
@@ -14,20 +15,20 @@ import copy
 # ==========================================
 # [설정] 경로 및 하이퍼파라미터
 # ==========================================
-CKPT_PATH = "../ckpts/byte_batch48_28000"
+CKPT_PATH = "."
 DATA_PROCESS_BATCH_SIZE = 1000
 NUM_PROC = 16
 SEQ_LENGTH = 128 * 1024
 DATASET_ID = "emozilla/pg19"
 DATA_SPLIT = "test"
 NUM_EVAL_SAMPLES = 40
-loss_save_dir = "../data/byte_losses_pg19_128k_hierarchy_test"  # 저장 경로 변경
+loss_save_dir = "data/byte_losses_pg19_128k_hierarchy_test"  # 저장 경로 변경
 os.makedirs(loss_save_dir, exist_ok=True)
 
 # ==========================================
 # [데이터] 로드 및 전처리
 # ==========================================
-tokenizer = ByteTokenizer()
+tokenizer = AutoTokenizer.from_pretrained(".", trust_remote_code=True)
 test_dataset = load_dataset(DATASET_ID, split=DATA_SPLIT)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -116,10 +117,11 @@ def get_loss_over_positions(model, input_ids, chunk_size=1024 * 30):
 def evaluate_hierarchy_ablation():
     # 1. 모델 로드
     print(f"Loading Model from {CKPT_PATH}...")
-    model = PMNetForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         CKPT_PATH,
         dtype=torch.float32,  # 안정성을 위해 float32 추천, 메모리 부족시 bfloat16
         device_map="cuda",
+        trust_remote_code=True,
     )
     param_size = sum(p.numel() for p in model.parameters())
     print(f"Model Size: {param_size / 1_000_000_000:.3f}B")
