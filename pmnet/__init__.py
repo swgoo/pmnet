@@ -7,7 +7,7 @@ from transformers.utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_pmnet import *
     from .modeling_pmnet import *
-    from .tokenizer import *
+    from .tokenization_pmnet import *
 else:
     import sys
 

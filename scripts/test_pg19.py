@@ -4,7 +4,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 
 from pmnet.modeling_pmnet import PMNetForCausalLM
-from pmnet.tokenizer import ByteTokenizer
+from pmnet.tokenization_pmnet import ByteTokenizer
 
 # -----------------------------------------------------------------------------
 # 설정 (본인 환경에 맞게 수정하세요)
